@@ -1,19 +1,23 @@
 import time
-import RPi.GPIO as GPIO
+import board
 import adafruit_dht
+import RPi.GPIO as GPIO
 from mfrc522 import SimpleMFRC522
 from gpiozero import LED, Servo
 import BlynkLib
 import firebase_admin
-from firebase_admin import credentials, db
+from firebase_admin import credentials, db, firestore
 from datetime import datetime
+import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning)
 
 # === BLYNK CONFIG ===
 BLYNK_AUTH = "vZdityxsgityg-vdzboal6srzYkm6Q6V"
 blynk = BlynkLib.Blynk(BLYNK_AUTH)
 
 # === PIN SETUP ===
-DHT_PIN = 4
+DHT_PIN = board.D4          # DHT11 signal pin (GPIO4)
 GAS_PIN = 17
 FLAME_PIN = 27
 TOUCH_PIN = 22
@@ -33,15 +37,16 @@ rfid = SimpleMFRC522()
 led_state = False
 
 # === FIREBASE CONFIG ===
-cred = credentials.Certificate("/home/pi/serviceAccountKey.json")  # path to your key file
+cred = credentials.Certificate("/home/andrei/serviceaccount.json")  # path to key file
 firebase_admin.initialize_app(cred, {
-    'databaseURL': 'https://smarthomepi-1c78f.firebaseio.com/'  # replace with your DB URL
+    'databaseURL': 'https://smarthomepi-1c78f.firebaseio.com/'
 })
 
 root_ref = db.reference("SmartHome")
+fs_db = firestore.client()
 
 def log_to_firebase(sensor, value, event):
-    """Store data in Firebase under SmartHome/logs"""
+    """Log to both Realtime DB and Firestore"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     data = {
         "timestamp": timestamp,
@@ -49,8 +54,14 @@ def log_to_firebase(sensor, value, event):
         "value": value,
         "event": event
     }
-    root_ref.child("logs").push(data)
-    print(f"[FIREBASE] Logged: {sensor} - {event}")
+    try:
+        # Realtime DB log
+        root_ref.child("logs").push(data)
+        # Firestore log
+        fs_db.collection("logs").add(data)
+        print(f"[FIREBASE] Logged: {sensor} - {event}")
+    except Exception as e:
+        print("[FIREBASE ERROR]", e)
 
 # === VIRTUAL PIN ASSIGNMENT ===
 VPIN_TEMP = 1
@@ -79,6 +90,7 @@ def v6_handler(value):
     if int(value[0]) == 1:
         open_door()
 
+# === LOCAL FUNCTIONS ===
 def toggle_led():
     global led_state
     led_state = not led_state
@@ -96,6 +108,7 @@ def open_door():
     blynk.virtual_write(VPIN_DOOR, 0)
     log_to_firebase("Door", "Opened", "RFID or Blynk")
 
+# === MAIN LOOP ===
 print("Smart Home IoT System Started.")
 print("Connecting to Blynk and Firebase...")
 
@@ -103,7 +116,7 @@ try:
     while True:
         blynk.run()
 
-        # === Touch sensor for LED ===
+        # === Touch sensor ===
         if GPIO.input(TOUCH_PIN) == GPIO.HIGH:
             toggle_led()
             time.sleep(0.5)
@@ -116,7 +129,7 @@ try:
             log_to_firebase("RFID", id, "Access Granted")
             time.sleep(1)
 
-        # === DHT sensor ===
+        # === DHT11 ===
         try:
             temp = dht_sensor.temperature
             hum = dht_sensor.humidity
@@ -125,8 +138,16 @@ try:
                 blynk.virtual_write(VPIN_TEMP, temp)
                 blynk.virtual_write(VPIN_HUM, hum)
                 log_to_firebase("DHT11", f"{temp:.1f}°C / {hum:.1f}%", "Read OK")
+                # Optional Firestore store
+                fs_db.collection("sensor_data").document("dht11").set({
+                    "temperature": temp,
+                    "humidity": hum,
+                    "timestamp": datetime.now()
+                })
         except RuntimeError:
             pass
+        except Exception as e:
+            print("[DHT ERROR]", e)
 
         # === Flame ===
         if GPIO.input(FLAME_PIN) == 0:
@@ -148,6 +169,7 @@ try:
 
 except KeyboardInterrupt:
     print("Exiting...")
+
 finally:
     GPIO.cleanup()
     print("GPIO cleaned up.")
